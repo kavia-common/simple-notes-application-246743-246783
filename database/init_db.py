@@ -1,132 +1,168 @@
 #!/usr/bin/env python3
-"""Initialize SQLite database for database"""
+"""Initialize SQLite database for the Notes app (database container).
 
-import sqlite3
+This script is the canonical initializer for the database container. It:
+- Creates the SQLite DB file if missing
+- Enables foreign keys
+- Creates the Notes schema: notes, tags, note_tags
+- Creates indexes optimized for list/search and tag filtering
+- Writes/updates db_connection.txt and db_visualizer/sqlite.env for convenience
+
+Run from the database container directory:
+  python3 init_db.py
+"""
+
+from __future__ import annotations
+
 import os
+import sqlite3
 
 DB_NAME = "myapp.db"
-DB_USER = "kaviasqlite"  # Not used for SQLite, but kept for consistency
-DB_PASSWORD = "kaviadefaultpassword"  # Not used for SQLite, but kept for consistency
-DB_PORT = "5000"  # Not used for SQLite, but kept for consistency
 
-print("Starting SQLite setup...")
 
-# Check if database already exists
-db_exists = os.path.exists(DB_NAME)
-if db_exists:
-    print(f"SQLite database already exists at {DB_NAME}")
-    # Verify it's accessible
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("SELECT 1")
-        conn.close()
-        print("Database is accessible and working.")
-    except Exception as e:
-        print(f"Warning: Database exists but may be corrupted: {e}")
-else:
-    print("Creating new SQLite database...")
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Create a SQLite connection with safe defaults."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    # Enforce FK constraints in SQLite.
+    conn.execute("PRAGMA foreign_keys = ON")
+    # Improve concurrent read/write behavior (safe default for local dev).
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
 
-# Create database with sample tables
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
 
-# Create initial schema
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS app_info (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT UNIQUE NOT NULL,
-        value TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+def _create_schema(conn: sqlite3.Connection) -> None:
+    """Create the Notes schema and indexes (idempotent)."""
+    cur = conn.cursor()
+
+    # Notes table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
     )
-""")
 
-# Create a sample users table as an example
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    # Tags table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(name COLLATE NOCASE)
+        )
+        """
     )
-""")
 
-# Insert initial data
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("project_name", "database"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("version", "0.1.0"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("author", "John Doe"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("description", ""))
+    # Join table: many-to-many notes <-> tags
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS note_tags (
+            note_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (note_id, tag_id),
+            FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+            FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        )
+        """
+    )
 
-conn.commit()
+    # Indexes
+    # Faster sorting/filtering for lists.
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_notes_updated_at
+        ON notes(updated_at DESC)
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_notes_created_at
+        ON notes(created_at DESC)
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_notes_is_favorite
+        ON notes(is_favorite, updated_at DESC)
+        """
+    )
+    # Tag lookup and join performance.
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tags_name
+        ON tags(name COLLATE NOCASE)
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_note_tags_tag_id
+        ON note_tags(tag_id)
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_note_tags_note_id
+        ON note_tags(note_id)
+        """
+    )
 
-# Get database statistics
-cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-table_count = cursor.fetchone()[0]
+    conn.commit()
 
-cursor.execute("SELECT COUNT(*) FROM app_info")
-record_count = cursor.fetchone()[0]
 
-conn.close()
+def _write_connection_files(db_path_abs: str) -> None:
+    """Write helper files used by this repository's database container tooling."""
+    # Save connection information to a file
+    current_dir = os.getcwd()
+    connection_string = f"sqlite:///{db_path_abs}"
 
-# Save connection information to a file
-current_dir = os.getcwd()
-connection_string = f"sqlite:///{current_dir}/{DB_NAME}"
-
-try:
-    with open("db_connection.txt", "w") as f:
-        f.write(f"# SQLite connection methods:\n")
+    with open("db_connection.txt", "w", encoding="utf-8") as f:
+        f.write("# SQLite connection methods:\n")
         f.write(f"# Python: sqlite3.connect('{DB_NAME}')\n")
         f.write(f"# Connection string: {connection_string}\n")
-        f.write(f"# File path: {current_dir}/{DB_NAME}\n")
-    print("Connection information saved to db_connection.txt")
-except Exception as e:
-    print(f"Warning: Could not save connection info: {e}")
+        f.write(f"# File path: {db_path_abs}\n")
 
-# Create environment variables file for Node.js viewer
-db_path = os.path.abspath(DB_NAME)
-
-# Ensure db_visualizer directory exists
-if not os.path.exists("db_visualizer"):
+    # Create environment variables file for Node.js viewer
     os.makedirs("db_visualizer", exist_ok=True)
-    print("Created db_visualizer directory")
+    with open("db_visualizer/sqlite.env", "w", encoding="utf-8") as f:
+        f.write(f'export SQLITE_DB="{db_path_abs}"\n')
 
-try:
-    with open("db_visualizer/sqlite.env", "w") as f:
-        f.write(f"export SQLITE_DB=\"{db_path}\"\n")
-    print(f"Environment variables saved to db_visualizer/sqlite.env")
-except Exception as e:
-    print(f"Warning: Could not save environment variables: {e}")
 
-print("\nSQLite setup complete!")
-print(f"Database: {DB_NAME}")
-print(f"Location: {current_dir}/{DB_NAME}")
-print("")
+def main() -> None:
+    """Initialize database schema."""
+    print("Starting SQLite Notes DB setup...")
 
-print("To use with Node.js viewer, run: source db_visualizer/sqlite.env")
+    db_exists = os.path.exists(DB_NAME)
+    if db_exists:
+        print(f"SQLite database already exists at {DB_NAME} (will ensure schema is present)")
+    else:
+        print("Creating new SQLite database...")
 
-print("\nTo connect to the database, use one of the following methods:")
-print(f"1. Python: sqlite3.connect('{DB_NAME}')")
-print(f"2. Connection string: {connection_string}")
-print(f"3. Direct file access: {current_dir}/{DB_NAME}")
-print("")
+    db_path_abs = os.path.abspath(DB_NAME)
 
-print("Database statistics:")
-print(f"  Tables: {table_count}")
-print(f"  App info records: {record_count}")
+    conn = _connect(DB_NAME)
+    try:
+        _create_schema(conn)
+    finally:
+        conn.close()
 
-# If sqlite3 CLI is available, show how to use it
-try:
-    import subprocess
-    result = subprocess.run(['which', 'sqlite3'], capture_output=True, text=True)
-    if result.returncode == 0:
-        print("")
-        print("SQLite CLI is available. You can also use:")
-        print(f"  sqlite3 {DB_NAME}")
-except:
-    pass
+    _write_connection_files(db_path_abs)
 
-# Exit successfully
-print("\nScript completed successfully.")
+    print("\nSQLite Notes DB setup complete!")
+    print(f"Database: {DB_NAME}")
+    print(f"Location: {db_path_abs}")
+    print("\nCreated/verified tables: notes, tags, note_tags")
+    print("Helper files updated: db_connection.txt, db_visualizer/sqlite.env")
+    print("\nScript completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
